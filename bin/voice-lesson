@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+# voice-lesson — transcribe audio lessons with whistle.
+#
+#   voice-lesson <audio-file> [more files...]
+#   voice-lesson --dir <folder>        transcribe every audio file in a folder
+#   voice-lesson --srt <file>          also write subtitles (.srt + .vtt)
+#   voice-lesson --lang <code>         force language (en/de/fr/es/it/nl/pl)
+#   voice-lesson --words               include per-word timestamps
+#   voice-lesson --keywords "a,b"      keyword biasing
+#   voice-lesson --out <dir>           output dir (default ~/.local/share/voice/lessons)
+#
+# Output per input: <stamp>-<slug>.txt, plus .srt/.vtt when --srt --words.
+# Any input format ffmpeg can read is accepted; it is normalised to 16 kHz mono
+# because whistle is trained on 16 kHz.
+set -euo pipefail
+
+VENV_PY="${VOICE_VENV_PY:-$HOME/.local/share/voice-venv/bin/python}"
+WHISTLE_WEIGHTS="${VOICE_WHISTLE_WEIGHTS:-$HOME/.local/share/voice/whistle.cact}"
+LESSONS_DIR="${VOICE_LESSONS_DIR:-$HOME/.local/share/voice/lessons}"
+SAMPLE_RATE="${VOICE_SAMPLE_RATE:-16000}"
+
+LANGUAGE=""
+WORDS=0
+SRT=0
+KEYWORDS=""
+OUT_DIR="$LESSONS_DIR"
+FILES=()
+AUDIO_DIR=""
+
+die() { printf '[voice-lesson] %s\n' "$*" >&2; exit 2; }
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --dir)      shift; AUDIO_DIR="${1:-}"; [ -n "$AUDIO_DIR" ] || die "--dir needs a folder"; shift ;;
+        --srt)      SRT=1; shift ;;
+        --lang)     shift; LANGUAGE="${1:-}"; [ -n "$LANGUAGE" ] || die "--lang needs a code"; shift ;;
+        --words)    WORDS=1; shift ;;
+        --keywords) shift; KEYWORDS="${1:-}"; [ -n "$KEYWORDS" ] || die "--keywords needs a list"; shift ;;
+        --out)      shift; OUT_DIR="${1:-}"; [ -n "$OUT_DIR" ] || die "--out needs a dir"; shift ;;
+        --help|-h)  sed -n '2,15p' "$0"; exit 0 ;;
+        --)         shift; while [ $# -gt 0 ]; do FILES+=("$1"); shift; done ;;
+        -*)         die "unknown option: $1" ;;
+        *)          FILES+=("$1"); shift ;;
+    esac
+done
+
+[ -f "$WHISTLE_WEIGHTS" ] || die "whistle weights missing: $WHISTLE_WEIGHTS (run: voice-install)"
+[ -x "$VENV_PY" ] || die "voice venv missing: $VENV_PY (run: voice-install)"
+mkdir -p "$OUT_DIR"
+
+ts() { date +%Y%m%d-%H%M%S; }
+slug() { printf '%s' "$*" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9._-]/_/g' | sed 's/__*/_/g'; }
+
+transcribe_one() {
+    local src="$1"
+    [ -f "$src" ] || { printf '[voice-lesson] skip (not a file): %s\n' "$src" >&2; return 0; }
+    local base stem stamp wav txt srt vtt
+    base="$(basename "$src")"
+    stem="$(slug "${base%.*}")"
+    stamp="$(ts)"
+    wav="$OUT_DIR/${stamp}-${stem}.wav"
+    txt="$OUT_DIR/${stamp}-${stem}.txt"
+    srt="$OUT_DIR/${stamp}-${stem}.srt"
+    vtt="$OUT_DIR/${stamp}-${stem}.vtt"
+
+    printf '[voice-lesson] %s -> %s\n' "$base" "$txt" >&2
+
+    ffmpeg -hide_banner -loglevel error -y -i "$src" -ar "$SAMPLE_RATE" -ac 1 -f wav "$wav" 2>/dev/null \
+        || { printf '[voice-lesson] ffmpeg failed for: %s\n' "$src" >&2; rm -f "$wav"; return 1; }
+
+    "$VENV_PY" - "$wav" "$WHISTLE_WEIGHTS" "$txt" "$LANGUAGE" "$KEYWORDS" "$WORDS" "$srt" "$vtt" <<'PY'
+import sys, json, os
+os.environ.setdefault("NEEDLE_TELEMETRY", "0")
+import needle
+
+wav, weights, out_txt, language, keywords, words, out_srt, out_vtt = sys.argv[1:9]
+language = language or None
+keywords = [k.strip() for k in keywords.split(",")] if keywords else None
+words = words == "1"
+
+r = needle.transcribe(wav, weights=weights, language=language, keywords=keywords, word_timestamps=words)
+text = (r.get("text") or "").strip()
+lang = r.get("language") or "und"
+
+with open(out_txt, "w", encoding="utf-8") as fh:
+    fh.write(text + "\n")
+
+def _ts(seconds, sep=","):
+    if seconds is None:
+        seconds = 0
+    total_ms = int(round(float(seconds) * 1000))
+    h, rem = divmod(total_ms, 3600000)
+    m, rem = divmod(rem, 60000)
+    s, ms = divmod(rem, 1000)
+    return f"{h:02d}:{m:02d}:{s:02d}{sep}{ms:03d}"
+
+words_list = r.get("words") or []
+if words and words_list:
+    # Group words into short caption chunks so the subtitles stay readable.
+    segs, cur, cur_start = [], [], None
+    for w in words_list:
+        if cur_start is None:
+            cur_start = w.get("start")
+        cur.append(w.get("word", ""))
+        if len(cur) >= 10:
+            segs.append((cur_start, w.get("end"), " ".join(cur)))
+            cur, cur_start = [], None
+    if cur:
+        segs.append((cur_start, words_list[-1].get("end"), " ".join(cur)))
+
+    with open(out_srt, "w", encoding="utf-8") as fh:
+        for i, (st, en, tx) in enumerate(segs, 1):
+            fh.write(f"{i}\n{_ts(st)} --> {_ts(en)}\n{tx}\n\n")
+    with open(out_vtt, "w", encoding="utf-8") as fh:
+        fh.write("WEBVTT\n\n")
+        for i, (st, en, tx) in enumerate(segs, 1):
+            fh.write(f"{i}\n{_ts(st, '.')} --> {_ts(en, '.')}\n{tx}\n\n")
+
+sys.stdout.write(json.dumps({
+    "text": text,
+    "language": lang,
+    "words": len(words_list),
+    "ttft_ms": r.get("ttft_ms"),
+    "decode_tps": r.get("decode_tps"),
+}) + "\n")
+PY
+    local rc=$?
+    rm -f "$wav"
+    [ "$rc" -eq 0 ] || return 1
+    printf '[voice-lesson] wrote %s\n' "$txt" >&2
+    if [ "$SRT" -eq 1 ]; then
+        [ -f "$srt" ] && printf '[voice-lesson] wrote %s\n' "$srt" >&2
+        [ -f "$vtt" ] && printf '[voice-lesson] wrote %s\n' "$vtt" >&2
+    fi
+    return 0
+}
+
+failed=0
+if [ -n "$AUDIO_DIR" ]; then
+    [ -d "$AUDIO_DIR" ] || die "not a directory: $AUDIO_DIR"
+    shopt -s nullglob
+    for f in "$AUDIO_DIR"/*.wav "$AUDIO_DIR"/*.mp3 "$AUDIO_DIR"/*.m4a "$AUDIO_DIR"/*.flac \
+             "$AUDIO_DIR"/*.ogg "$AUDIO_DIR"/*.aac "$AUDIO_DIR"/*.opus "$AUDIO_DIR"/*.webm; do
+        transcribe_one "$f" || failed=1
+    done
+    shopt -u nullglob
+else
+    [ ${#FILES[@]} -gt 0 ] || die "usage: voice-lesson <audio-file> [--srt] [--lang code] [--words] [--keywords list] [--out dir]"
+    for f in "${FILES[@]}"; do transcribe_one "$f" || failed=1; done
+fi
+
+exit $failed

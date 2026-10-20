@@ -1,0 +1,50 @@
+#!/usr/bin/env python3
+"""Whistle STT bridge for hermes' `local_command` STT provider.
+
+hermes runs the command configured in HERMES_LOCAL_STT_COMMAND and reads the
+transcript from the first .txt file in {output_dir}. This script transcribes
+the prepared audio with whistle (Cactus-Compute, via cactus-needle) and writes
+that .txt file.
+
+Usage: voice-hermes-stt <input_path> <output_dir>
+"""
+import os
+import subprocess
+import sys
+import tempfile
+
+os.environ.setdefault("NEEDLE_TELEMETRY", "0")
+
+WEIGHTS = os.environ.get(
+    "VOICE_WHISTLE_WEIGHTS", os.path.expanduser("~/.local/share/voice/whistle.cact")
+)
+SAMPLE_RATE = "16000"
+
+
+def main() -> int:
+    if len(sys.argv) < 3:
+        print("usage: voice-hermes-stt <input_path> <output_dir>", file=sys.stderr)
+        return 2
+    src, out_dir = sys.argv[1], sys.argv[2]
+    os.makedirs(out_dir, exist_ok=True)
+
+    with tempfile.TemporaryDirectory(prefix="voice-hermes-stt-") as tmp:
+        wav = os.path.join(tmp, "audio.wav")
+        subprocess.run(
+            ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", src,
+             "-ar", SAMPLE_RATE, "-ac", "1", "-f", "wav", wav],
+            check=True, capture_output=True,
+        )
+        import needle
+
+        result = needle.transcribe(wav, weights=WEIGHTS)
+
+    text = (result.get("text") or "").strip()
+    with open(os.path.join(out_dir, "transcript.txt"), "w", encoding="utf-8") as fh:
+        fh.write(text + "\n")
+    sys.stdout.write(text + "\n")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

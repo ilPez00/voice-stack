@@ -1,0 +1,161 @@
+#!/usr/bin/env bash
+# voice — STT -> TTS loop.
+#
+#   voice record [seconds]   record mic, transcribe (whistle), speak back, print text
+#   voice say <text>         speak text (espeak-ng)
+#   voice transcribe <file>  transcribe an existing audio file, print text
+#   voice hermes <text>      send text to the hermes gateway, print its reply
+#   voice loop               continuous voice loop (Ctrl-C to stop)
+#
+# STT is whistle (Cactus-Compute) via cactus-needle: a 16.9 MB .cact model that
+# runs on CPU with no dependencies and speaks en/de/fr/es/it/nl/pl.
+# TTS is espeak-ng. Both are local; nothing leaves the box unless you point
+# VOICE_LLM_CMD or the hermes hook at something remote.
+set -euo pipefail
+
+HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]:-$0}")")" && pwd)"
+VENV_PY="${VOICE_VENV_PY:-$HOME/.local/share/voice-venv/bin/python}"
+ESPEAK="${VOICE_ESPEAK:-/usr/bin/espeak-ng}"
+VOICE_ESPEAK_VOICE="${VOICE_ESPEAK_VOICE:-}"
+ALSA_DEV="${VOICE_ALSA_DEV:-default}"
+SAMPLE_RATE="${VOICE_SAMPLE_RATE:-16000}"
+WHISTLE_WEIGHTS="${VOICE_WHISTLE_WEIGHTS:-$HOME/.local/share/voice/whistle.cact}"
+WORK="${VOICE_WORK_DIR:-$HOME/.local/state/voice}"
+HERMES_URL="${VOICE_HERMES_URL:-http://127.0.0.1:8642/v1/chat/completions}"
+HERMES_ENV="${VOICE_HERMES_ENV:-$HOME/.hermes/.env}"
+LAST="$WORK/last-transcript.txt"
+
+mkdir -p "$WORK"
+
+log() { printf '[voice] %s\n' "$*" >&2; }
+die() { log "$*"; exit 2; }
+
+[ -x "$VENV_PY" ] || die "voice venv missing: $VENV_PY (run: voice-install)"
+[ -f "$WHISTLE_WEIGHTS" ] || die "whistle weights missing: $WHISTLE_WEIGHTS (run: voice-install)"
+
+say() {
+    if [ -n "${VOICE_ESPEAK_VOICE:-}" ]; then
+        "$ESPEAK" -v "$VOICE_ESPEAK_VOICE" -s "${VOICE_ESPEAK_SPEED:-150}" "$@" 2>/dev/null
+    else
+        "$ESPEAK" -s "${VOICE_ESPEAK_SPEED:-150}" "$@" 2>/dev/null
+    fi
+}
+
+# API_SERVER_KEY from the hermes env file, if present.
+hermes_key() {
+    [ -f "$HERMES_ENV" ] || return 0
+    sed -n 's/^API_SERVER_KEY=//p' "$HERMES_ENV" | head -1 | tr -d '"'"'"' \r\n'
+}
+
+# Send the text to the hermes gateway (OpenAI-compatible /v1/chat/completions).
+post_hermes() {
+    local text="$1"
+    [ -n "$HERMES_URL" ] || return 0
+    local key body
+    key="$(hermes_key)"
+    body="$(printf '%s' "$text" | python3 -c 'import json,sys; print(json.dumps({"model":"hermes-agent","messages":[{"role":"user","content":sys.stdin.read()}],"max_tokens":400}))')"
+    if [ -n "$key" ]; then
+        /usr/bin/curl -s -m 90 -X POST -H "Content-Type: application/json" \
+            -H "Authorization: Bearer $key" -d "$body" "$HERMES_URL" 2>/dev/null
+    else
+        /usr/bin/curl -s -m 90 -X POST -H "Content-Type: application/json" \
+            -d "$body" "$HERMES_URL" 2>/dev/null
+    fi
+}
+
+# Whistle requires 16 kHz mono. Normalise any input, then transcribe against
+# the whistle.cact weights. The transcript is also written to the sidecar file
+# so other tools (a HUD, a hook) can pick it up without re-running STT.
+transcribe_file() {
+    local file="$1"
+    local norm="$WORK/voice-norm-$(date +%s%N).wav"
+    ffmpeg -y -i "$file" -ar "$SAMPLE_RATE" -ac 1 -f wav "$norm" 2>/dev/null \
+        || die "ffmpeg could not read: $file"
+    "$VENV_PY" - "$norm" "$WHISTLE_WEIGHTS" "$LAST" <<'PY'
+import os, sys
+os.environ.setdefault("NEEDLE_TELEMETRY", "0")
+import needle
+
+norm, weights, last = sys.argv[1], sys.argv[2], sys.argv[3]
+r = needle.transcribe(norm, weights=weights)
+text = (r.get("text") or "").strip()
+sys.stdout.write(text + "\n")
+try:
+    with open(last, "w") as fh:
+        fh.write(text + "\n")
+except OSError:
+    pass
+PY
+    rm -f "$norm"
+}
+
+# Run the transcript through the brain and return the reply.
+# Priority: $VOICE_LLM_CMD if set, else the hermes gateway.
+llm_reply() {
+    local text="$1"
+    if [ -n "${VOICE_LLM_CMD:-}" ]; then
+        printf '%s' "$text" | eval "$VOICE_LLM_CMD" 2>/dev/null || printf '%s' "$text"
+        return 0
+    fi
+    local reply
+    reply="$(post_hermes "$text" | python3 -c 'import json,sys
+try:
+    d = json.load(sys.stdin)
+    sys.stdout.write((d.get("choices") or [{}])[0].get("message", {}).get("content", "") or "")
+except Exception:
+    pass' 2>/dev/null)"
+    [ -n "$reply" ] || reply="$text"
+    printf '%s' "$reply"
+}
+
+cmd="${1:-}"
+shift || true
+
+case "$cmd" in
+    say)
+        [ $# -gt 0 ] || die "usage: voice say <text>"
+        say "$*"
+        ;;
+    transcribe)
+        [ $# -gt 0 ] || die "usage: voice transcribe <file>"
+        transcribe_file "$1"
+        ;;
+    hermes)
+        [ $# -gt 0 ] || die "usage: voice hermes <text>"
+        post_hermes "$*"
+        ;;
+    record)
+        secs="${1:-5}"
+        wav="$WORK/voice-$(date +%s%N).wav"
+        log "recording $secs s from '$ALSA_DEV' (Ctrl-C to stop early)"
+        arecord -D "$ALSA_DEV" -f S16_LE -r "$SAMPLE_RATE" -d "$secs" -t wav "$wav" 2>/dev/null \
+            || die "arecord failed on '$ALSA_DEV' (check: arecord -l)"
+        log "transcribing with whistle ..."
+        text="$(transcribe_file "$wav")"
+        log "you said: $text"
+        printf '%s\n' "$text"
+        if [ -n "$text" ]; then
+            reply="$(llm_reply "$text")"
+            [ "$reply" != "$text" ] && { log "reply: $reply"; printf '%s\n' "$reply"; }
+            say "$reply"
+        fi
+        rm -f "$wav"
+        ;;
+    loop)
+        log "voice loop: Ctrl-C to exit"
+        while true; do
+            text="$(arecord -D "$ALSA_DEV" -f S16_LE -r "$SAMPLE_RATE" -d 5 -t wav "$WORK/loop.wav" 2>/dev/null \
+                && transcribe_file "$WORK/loop.wav" || true)"
+            rm -f "$WORK/loop.wav"
+            text="$(printf '%s' "$text" | sed '/^$/d')"
+            [ -z "$text" ] && continue
+            reply="$(llm_reply "$text")"
+            printf '[voice] %s\n' "$reply"
+            say "$reply"
+        done
+        ;;
+    *)
+        echo "usage: voice {say <text>|transcribe <file>|hermes <text>|record [seconds]|loop}" >&2
+        exit 2
+        ;;
+esac

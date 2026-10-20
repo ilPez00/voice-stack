@@ -1,0 +1,168 @@
+#!/usr/bin/env bash
+# voice-install — install the whistle voice stack on this host.
+#
+# Idempotent: safe to run twice. Never deletes user data.
+#
+#   voice-install              install (venv, weights, CLIs, hermes hooks)
+#   voice-install --check      report what is missing, change nothing
+#   voice-install --no-hermes  skip the hermes config hook
+#
+# Layout it owns:
+#   ~/.local/share/voice-venv   python venv with cactus-needle
+#   ~/.local/share/voice/       whistle.cact weights
+#   ~/.local/state/voice/       runtime state (transcripts, audio)
+#   ~/.local/bin/voice*         the CLIs
+set -uo pipefail
+
+HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]:-$0}")")" && pwd)"
+# Run from a checkout (<root>/bin/voice-install) or installed flat in a bin dir.
+if [ "$(basename "$HERE")" = "bin" ] && [ -d "$HERE/voice" ]; then
+    ROOT="$(cd "$HERE/.." && pwd)"; BIN_DIR="$HERE"
+elif [ -d "$HERE/bin" ]; then
+    ROOT="$HERE"; BIN_DIR="$HERE/bin"
+else
+    ROOT="$HERE"; BIN_DIR="$HERE"
+fi
+VENV="${VOICE_VENV:-$HOME/.local/share/voice-venv}"
+SHARE="${VOICE_SHARE:-$HOME/.local/share/voice}"
+WEIGHTS="$SHARE/whistle.cact"
+STATE="${VOICE_STATE:-$HOME/.local/state/voice}"
+LOCAL_BIN="$HOME/.local/bin"
+PYTHON="${VOICE_PYTHON:-python3}"
+CHECK_ONLY=0
+WITH_HERMES=1
+LOG="${VOICE_INSTALL_LOG:-/tmp/voice-install.log}"
+
+for a in "$@"; do
+    case "$a" in
+        --check)     CHECK_ONLY=1 ;;
+        --no-hermes) WITH_HERMES=0 ;;
+        -h|--help)   sed -n '2,20p' "$0"; exit 0 ;;
+        *) echo "unknown option: $a" >&2; exit 2 ;;
+    esac
+done
+
+mkdir -p "$(dirname "$LOG")"
+log() { echo "[$(date -u +'%H:%M:%S')] $*" | tee -a "$LOG"; }
+ok()  { log "ok    $*"; }
+bad() { log "MISS  $*"; }
+
+need() { [ -e "$1" ] && ok "$2" || bad "$2"; }
+
+log "=== voice-install $(hostname) check_only=$CHECK_ONLY ==="
+
+# ---------- 1. venv with cactus-needle ----------
+if [ ! -x "$VENV/bin/python" ]; then
+    if [ "$CHECK_ONLY" -eq 1 ]; then
+        bad "venv $VENV"
+    else
+        log "creating venv $VENV"
+        "$PYTHON" -m venv "$VENV" || { log "venv creation failed"; exit 1; }
+        "$VENV/bin/pip" install -q --no-input cactus-needle || { log "cactus-needle install failed"; exit 1; }
+    fi
+else
+    ok "venv $VENV"
+    if [ "$CHECK_ONLY" -eq 0 ]; then
+        "$VENV/bin/pip" install -q --no-input cactus-needle 2>/dev/null \
+            && ok "cactus-needle up to date" \
+            || bad "cactus-needle refresh failed (venv still usable)"
+    fi
+fi
+if [ -x "$VENV/bin/python" ]; then
+    "$VENV/bin/python" -c "import needle" 2>/dev/null && ok "cactus-needle importable" || bad "cactus-needle not importable"
+fi
+
+# ---------- 2. whistle weights ----------
+if [ -f "$WEIGHTS" ]; then
+    ok "whistle weights $WEIGHTS"
+elif [ "$CHECK_ONLY" -eq 1 ]; then
+    bad "whistle weights $WEIGHTS"
+else
+    log "downloading whistle.cact (16.9 MB)"
+    mkdir -p "$SHARE"
+    if [ -x "$VENV/bin/needle" ]; then
+        ( cd "$SHARE" && "$VENV/bin/needle" download whistle ) >>"$LOG" 2>&1 \
+            || log "needle download failed"
+    fi
+    [ -f "$SHARE/whistle.cact" ] || [ -f "$SHARE/.cact" ] || true
+    if [ ! -f "$WEIGHTS" ]; then
+        # the downloader writes whistle.cact into the cwd
+        found="$(find "$SHARE" -maxdepth 2 -name 'whistle.cact' -type f 2>/dev/null | head -1)"
+        [ -n "$found" ] && mv "$found" "$WEIGHTS"
+    fi
+    [ -f "$WEIGHTS" ] && ok "whistle weights installed" || bad "whistle weights still missing"
+fi
+
+# ---------- 3. CLIs on PATH ----------
+mkdir -p "$LOCAL_BIN"
+for s in voice voice-lesson voice-hermes-stt; do
+    if [ -f "$BIN_DIR/$s" ]; then
+        if [ "$CHECK_ONLY" -eq 1 ]; then
+            need "$LOCAL_BIN/$s" "$s on PATH"
+        else
+            install -m 0755 "$BIN_DIR/$s" "$LOCAL_BIN/$s" && ok "$s -> $LOCAL_BIN/$s"
+        fi
+    else
+        bad "source script missing: $BIN_DIR/$s"
+    fi
+done
+
+# ---------- 4. runtime state ----------
+mkdir -p "$STATE"
+ok "state dir $STATE"
+
+# ---------- 5. hermes hook ----------
+HERMES_ENV="$HOME/.hermes/.env"
+HERMES_CFG="$HOME/.hermes/config.yaml"
+STT_CMD="$VENV/bin/python $LOCAL_BIN/voice-hermes-stt {input_path} {output_dir}"
+if [ "$WITH_HERMES" -eq 1 ] && [ -f "$HERMES_ENV" ]; then
+    if grep -q "^HERMES_LOCAL_STT_COMMAND=" "$HERMES_ENV"; then
+        if [ "$CHECK_ONLY" -eq 1 ]; then
+            ok "HERMES_LOCAL_STT_COMMAND set"
+        else
+            # rewrite in place without printing the value
+            python3 - "$HERMES_ENV" "$STT_CMD" <<'PY'
+import re, sys, pathlib
+p = pathlib.Path(sys.argv[1]); t = p.read_text()
+p.write_text(re.sub(r"^HERMES_LOCAL_STT_COMMAND=.*$",
+                     "HERMES_LOCAL_STT_COMMAND=" + sys.argv[2], t, flags=re.M))
+PY
+            ok "HERMES_LOCAL_STT_COMMAND updated"
+        fi
+    elif [ "$CHECK_ONLY" -eq 1 ]; then
+        bad "HERMES_LOCAL_STT_COMMAND not set in $HERMES_ENV"
+    else
+        printf '\n# whistle STT bridge (Cactus-Compute) for hermes local_command provider\nHERMES_LOCAL_STT_COMMAND=%s\n' "$STT_CMD" >> "$HERMES_ENV"
+        ok "HERMES_LOCAL_STT_COMMAND added"
+    fi
+else
+    [ "$WITH_HERMES" -eq 1 ] && bad "hermes env not found at $HERMES_ENV (skipped)"
+fi
+
+# ---------- 6. hermes TTS: local espeak command provider ----------
+if [ "$WITH_HERMES" -eq 1 ] && [ -f "$HERMES_CFG" ]; then
+    if grep -qE "^[[:space:]]+espeak:" "$HERMES_CFG"; then
+        ok "hermes tts command provider present"
+    elif [ "$CHECK_ONLY" -eq 1 ]; then
+        bad "hermes tts command provider missing"
+    else
+        cp "$HERMES_CFG" "$HERMES_CFG.bak-voice-install-$(date -u +%Y%m%d-%H%M%S)"
+        python3 - "$HERMES_CFG" <<'PY'
+import sys, pathlib
+p = pathlib.Path(sys.argv[1]); t = p.read_text()
+old = "tts:\n  provider: "
+new = """tts:
+  providers:
+    espeak:
+      type: command
+      command: /usr/bin/espeak-ng -w {output_path} -s {speed} < {input_path}
+  provider: """
+if old in t and "    espeak:" not in t:
+    t = t.replace(old, new, 1)
+    p.write_text(t)
+PY
+        ok "hermes tts command provider added"
+    fi
+fi
+
+log "=== done ==="
