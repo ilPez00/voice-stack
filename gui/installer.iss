@@ -7,6 +7,7 @@ OutputDir=installer
 OutputBaseFilename=voice-stack-setup
 Compression=lzma
 SolidCompression=yes
+LicenseFile=..\LICENSE
 
 [Files]
 Source: "..\dist\voice-stack-gui\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs
