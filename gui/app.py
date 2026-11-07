@@ -47,9 +47,11 @@ class App(tk.Tk):
         self.transcribe_tab = TranscribeTab(nb)
         self.lesson_tab = LessonTab(nb)
         self.say_tab = SayTab(nb)
+        self.settings_tab = SettingsTab(nb)
         nb.add(self.transcribe_tab, text="Transcribe")
         nb.add(self.lesson_tab, text="Lessons")
         nb.add(self.say_tab, text="Say")
+        nb.add(self.settings_tab, text="Settings")
 
     def run_cmd(self, cmd, log_widget, btn=None):
         if btn:
@@ -165,6 +167,39 @@ class SayTab(ttk.Frame):
             messagebox.showerror("Unsupported", str(e)); return
         self.master.run_cmd(cmd, self.log, self.btn)
 
+
+
+
+class SettingsTab(ttk.Frame):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.env_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
+        keys = ["VOICE_VENV_PY", "VOICE_WHISTLE_WEIGHTS", "VOICE_ESPEAK", "VOICE_HERMES_URL", "VOICE_LESSONS_DIR"]
+        frm = ttk.Frame(self); frm.pack(fill="x", padx=8, pady=8)
+        existing = {}
+        if os.path.exists(self.env_path):
+            for line in open(self.env_path):
+                if "=" in line and not line.startswith("#"):
+                    k, v = line.strip().split("=", 1)
+                    existing[k] = v
+        self.vars = {}
+        for k in keys:
+            row = ttk.Frame(frm); row.pack(fill="x", pady=2)
+            ttk.Label(row, text=k, width=22).pack(side="left")
+            v = tk.StringVar(value=existing.get(k, os.environ.get(k, "")))
+            self.vars[k] = v
+            ttk.Entry(row, textvariable=v, width=60).pack(side="left", padx=4)
+        ttk.Button(frm, text="Salva .env", command=self.save).pack(pady=8, anchor="w")
+        self.status = tk.StringVar(value="")
+        ttk.Label(frm, textvariable=self.status).pack(anchor="w")
+        guide = "Guida: installa con voice-install, poi imposta i path se necessario. Windows richiede WSL."
+        ttk.Label(self, text=guide, justify="left").pack(anchor="w", padx=8, pady=8)
+
+    def save(self):
+        lines = [f"{k}={v.get().strip()}" for k, v in self.vars.items()]
+        with open(self.env_path, "w") as f:
+            f.write("\n".join(lines) + "\n")
+        self.status.set(f"salvato: {self.env_path}")
 
 if __name__ == "__main__":
     app = App()
