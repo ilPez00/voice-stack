@@ -1,0 +1,19 @@
+name: Build GUI
+on: [push, workflow_dispatch]
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m pip install --upgrade pip pyinstaller
+      - run: pyinstaller --noconfirm --windowed --paths . --name voice-stack-gui gui/app.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: voice-stack-gui-${{ matrix.os }}
+          path: dist/
